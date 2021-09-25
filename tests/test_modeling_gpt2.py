@@ -14,9 +14,10 @@
 # limitations under the License.
 
 
+import datetime
 import unittest
 
-from transformers import is_torch_available
+from transformers import GPT2Config, is_torch_available
 from transformers.testing_utils import require_torch, slow, torch_device
 
 from .test_configuration_common import ConfigTester
@@ -29,9 +30,9 @@ if is_torch_available():
 
     from transformers import (
         GPT2_PRETRAINED_MODEL_ARCHIVE_LIST,
-        GPT2Config,
         GPT2DoubleHeadsModel,
         GPT2ForSequenceClassification,
+        GPT2ForTokenClassification,
         GPT2LMHeadModel,
         GPT2Model,
         GPT2Tokenizer,
@@ -95,7 +96,7 @@ class GPT2ModelTester:
     def get_large_model_config(self):
         return GPT2Config.from_pretrained("gpt2")
 
-    def prepare_config_and_inputs(self, gradient_checkpointing=False):
+    def prepare_config_and_inputs(self):
         input_ids = ids_tensor([self.batch_size, self.seq_length], self.vocab_size)
 
         input_mask = None
@@ -118,25 +119,7 @@ class GPT2ModelTester:
             token_labels = ids_tensor([self.batch_size, self.seq_length], self.num_labels)
             choice_labels = ids_tensor([self.batch_size], self.num_choices)
 
-        config = GPT2Config(
-            vocab_size=self.vocab_size,
-            n_embd=self.hidden_size,
-            n_layer=self.num_hidden_layers,
-            n_head=self.num_attention_heads,
-            # intermediate_size=self.intermediate_size,
-            # hidden_act=self.hidden_act,
-            # hidden_dropout_prob=self.hidden_dropout_prob,
-            # attention_probs_dropout_prob=self.attention_probs_dropout_prob,
-            n_positions=self.max_position_embeddings,
-            n_ctx=self.max_position_embeddings,
-            # type_vocab_size=self.type_vocab_size,
-            # initializer_range=self.initializer_range,
-            use_cache=not gradient_checkpointing,
-            bos_token_id=self.bos_token_id,
-            eos_token_id=self.eos_token_id,
-            pad_token_id=self.pad_token_id,
-            gradient_checkpointing=gradient_checkpointing,
-        )
+        config = self.get_config()
 
         head_mask = ids_tensor([self.num_hidden_layers, self.num_attention_heads], 2)
 
@@ -150,6 +133,26 @@ class GPT2ModelTester:
             sequence_labels,
             token_labels,
             choice_labels,
+        )
+
+    def get_config(self):
+        return GPT2Config(
+            vocab_size=self.vocab_size,
+            n_embd=self.hidden_size,
+            n_layer=self.num_hidden_layers,
+            n_head=self.num_attention_heads,
+            n_inner=self.intermediate_size,
+            activation_function=self.hidden_act,
+            resid_pdrop=self.hidden_dropout_prob,
+            attn_pdrop=self.attention_probs_dropout_prob,
+            n_positions=self.max_position_embeddings,
+            n_ctx=self.max_position_embeddings,
+            type_vocab_size=self.type_vocab_size,
+            initializer_range=self.initializer_range,
+            use_cache=True,
+            bos_token_id=self.bos_token_id,
+            eos_token_id=self.eos_token_id,
+            pad_token_id=self.pad_token_id,
         )
 
     def prepare_config_and_inputs_for_decoder(self):
@@ -318,9 +321,13 @@ class GPT2ModelTester:
         self.parent.assertEqual(result.loss.shape, ())
         self.parent.assertEqual(result.logits.shape, (self.batch_size, self.seq_length, self.vocab_size))
 
-    def create_and_check_forward_and_backwards(self, config, input_ids, input_mask, head_mask, token_type_ids, *args):
+    def create_and_check_forward_and_backwards(
+        self, config, input_ids, input_mask, head_mask, token_type_ids, *args, gradient_checkpointing=False
+    ):
         model = GPT2LMHeadModel(config)
         model.to(torch_device)
+        if gradient_checkpointing:
+            model.gradient_checkpointing_enable()
 
         result = model(input_ids, token_type_ids=token_type_ids, labels=input_ids)
         self.parent.assertEqual(result.loss.shape, ())
@@ -360,9 +367,18 @@ class GPT2ModelTester:
         model = GPT2ForSequenceClassification(config)
         model.to(torch_device)
         model.eval()
-        print(config.num_labels, sequence_labels.size())
         result = model(input_ids, attention_mask=input_mask, token_type_ids=token_type_ids, labels=sequence_labels)
         self.parent.assertEqual(result.logits.shape, (self.batch_size, self.num_labels))
+
+    def create_and_check_gpt2_for_token_classification(
+        self, config, input_ids, input_mask, head_mask, token_type_ids, mc_token_ids, sequence_labels, *args
+    ):
+        config.num_labels = self.num_labels
+        model = GPT2ForTokenClassification(config)
+        model.to(torch_device)
+        model.eval()
+        result = model(input_ids, attention_mask=input_mask, token_type_ids=token_type_ids)
+        self.parent.assertEqual(result.logits.shape, (self.batch_size, self.seq_length, self.num_labels))
 
     def prepare_config_and_inputs_for_common(self):
         config_and_inputs = self.prepare_config_and_inputs()
@@ -392,12 +408,13 @@ class GPT2ModelTester:
 class GPT2ModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
 
     all_model_classes = (
-        (GPT2Model, GPT2LMHeadModel, GPT2DoubleHeadsModel, GPT2ForSequenceClassification)
+        (GPT2Model, GPT2LMHeadModel, GPT2DoubleHeadsModel, GPT2ForSequenceClassification, GPT2ForTokenClassification)
         if is_torch_available()
         else ()
     )
     all_generative_model_classes = (GPT2LMHeadModel, GPT2DoubleHeadsModel) if is_torch_available() else ()
-    all_parallelizable_model_classes = (GPT2LMHeadModel,) if is_torch_available() else ()
+    all_parallelizable_model_classes = (GPT2LMHeadModel, GPT2DoubleHeadsModel) if is_torch_available() else ()
+    fx_ready_model_classes = all_model_classes
     test_missing_keys = False
     test_model_parallel = True
 
@@ -459,9 +476,13 @@ class GPT2ModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_gpt2_for_sequence_classification(*config_and_inputs)
 
+    def test_gpt2_token_classification_model(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_gpt2_for_token_classification(*config_and_inputs)
+
     def test_gpt2_gradient_checkpointing(self):
-        config_and_inputs = self.model_tester.prepare_config_and_inputs(gradient_checkpointing=True)
-        self.model_tester.create_and_check_forward_and_backwards(*config_and_inputs)
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_forward_and_backwards(*config_and_inputs, gradient_checkpointing=True)
 
     @slow
     def test_batch_generation(self):
@@ -594,7 +615,11 @@ class GPT2ModelLanguageGenerationTest(unittest.TestCase):
     @slow
     def test_lm_generate_gpt2(self):
         for checkpointing in [True, False]:
-            model = GPT2LMHeadModel.from_pretrained("gpt2", gradient_checkpointing=checkpointing)
+            model = GPT2LMHeadModel.from_pretrained("gpt2")
+            if checkpointing:
+                model.gradient_checkpointing_enable()
+            else:
+                model.gradient_checkpointing_disable()
             model.to(torch_device)
             input_ids = torch.tensor([[464, 3290]], dtype=torch.long, device=torch_device)  # The dog
             expected_output_ids = [
@@ -649,3 +674,44 @@ class GPT2ModelLanguageGenerationTest(unittest.TestCase):
         self.assertTrue(
             all([output_seq_strs[idx] != output_seq_tt_strs[idx] for idx in range(len(output_seq_tt_strs))])
         )  # token_type_ids should change output
+
+    @slow
+    def test_gpt2_sample_max_time(self):
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        model = GPT2LMHeadModel.from_pretrained("gpt2")
+        model.to(torch_device)
+
+        torch.manual_seed(0)
+        tokenized = tokenizer("Today is a nice day and", return_tensors="pt", return_token_type_ids=True)
+        input_ids = tokenized.input_ids.to(torch_device)
+
+        MAX_TIME = 0.5
+
+        start = datetime.datetime.now()
+        model.generate(input_ids, do_sample=True, max_time=MAX_TIME, max_length=256)
+        duration = datetime.datetime.now() - start
+        self.assertGreater(duration, datetime.timedelta(seconds=MAX_TIME))
+        self.assertLess(duration, datetime.timedelta(seconds=1.5 * MAX_TIME))
+
+        start = datetime.datetime.now()
+        model.generate(input_ids, do_sample=False, max_time=MAX_TIME, max_length=256)
+        duration = datetime.datetime.now() - start
+        self.assertGreater(duration, datetime.timedelta(seconds=MAX_TIME))
+        self.assertLess(duration, datetime.timedelta(seconds=1.5 * MAX_TIME))
+
+        start = datetime.datetime.now()
+        model.generate(input_ids, do_sample=False, num_beams=2, max_time=MAX_TIME, max_length=256)
+        duration = datetime.datetime.now() - start
+        self.assertGreater(duration, datetime.timedelta(seconds=MAX_TIME))
+        self.assertLess(duration, datetime.timedelta(seconds=1.5 * MAX_TIME))
+
+        start = datetime.datetime.now()
+        model.generate(input_ids, do_sample=True, num_beams=2, max_time=MAX_TIME, max_length=256)
+        duration = datetime.datetime.now() - start
+        self.assertGreater(duration, datetime.timedelta(seconds=MAX_TIME))
+        self.assertLess(duration, datetime.timedelta(seconds=1.5 * MAX_TIME))
+
+        start = datetime.datetime.now()
+        model.generate(input_ids, do_sample=False, max_time=None, max_length=256)
+        duration = datetime.datetime.now() - start
+        self.assertGreater(duration, datetime.timedelta(seconds=1.5 * MAX_TIME))
